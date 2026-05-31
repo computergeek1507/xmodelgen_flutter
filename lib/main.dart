@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'src/auto_wire.dart';
 import 'src/dxf_data.dart';
@@ -63,6 +64,10 @@ class _HomePageState extends State<HomePage> {
   Offset _viewOffset = Offset.zero;
   double _fitScale = 1; // scale of the fit-to-window view, for clamping zoom
   bool _needFit = true;
+  bool _panning = false; // a Shift-drag pan is in progress
+
+  // Hold Shift while dragging to pan the view (instead of selecting/wiring).
+  bool get _panModifier => HardwareKeyboard.instance.isShiftPressed;
   String _status = 'Open a DXF to begin.';
 
   // Read the fields live so Auto Wire / detect always use what's in the box,
@@ -680,7 +685,9 @@ class _HomePageState extends State<HomePage> {
             if (_mode == _InteractMode.manual) _undoLast();
           },
           onPanStart: (d) {
-            if (_mode == _InteractMode.section) {
+            if (_panModifier) {
+              _panning = true; // Shift-drag: pan the view
+            } else if (_mode == _InteractMode.section) {
               setState(() {
                 _dragStart = d.localPosition;
                 _dragCurrent = d.localPosition;
@@ -698,7 +705,9 @@ class _HomePageState extends State<HomePage> {
             }
           },
           onPanUpdate: (d) {
-            if (_mode == _InteractMode.section) {
+            if (_panning) {
+              setState(() => _viewOffset += d.delta); // pan with the drag
+            } else if (_mode == _InteractMode.section) {
               setState(() => _dragCurrent = d.localPosition);
             } else if (_mode == _InteractMode.lasso) {
               setState(() => _lassoPoints.add(d.localPosition));
@@ -711,7 +720,9 @@ class _HomePageState extends State<HomePage> {
             }
           },
           onPanEnd: (_) {
-            if (_mode == _InteractMode.section &&
+            if (_panning) {
+              _panning = false;
+            } else if (_mode == _InteractMode.section &&
                 _dragStart != null &&
                 _dragCurrent != null) {
               final a = painter.toScene(_dragStart!);
