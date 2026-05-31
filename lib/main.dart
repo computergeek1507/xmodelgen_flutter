@@ -86,11 +86,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  double _mmToDrawing(double mm) {
-    final f = millimetersPerUnit(_effectiveInsUnits());
-    return f <= 0 ? mm : mm / f; // mm -> drawing units
-  }
-
   Future<void> _openDxf() async {
     final result = await FilePicker.pickFiles(
       dialogTitle: 'Open DXF',
@@ -136,15 +131,48 @@ class _HomePageState extends State<HomePage> {
     _detect();
   }
 
+  // Detect DXF holes, returning (mmPerUnit, holes, unitCode). For a unitless file
+  // on "Auto" the units are unknown, so try the common candidates and use whichever
+  // finds the most holes near the target diameter.
+  (double, List<Hole>, int) _dxfDetect(double holeDiaMm) {
+    if (_units == 0 && (_dxf?.insUnits ?? 0) == 0) {
+      var bestCode = 4; // mm (1 unit = 1 mm)
+      var best = findHoles(_dxf!, holeDiaMm, 0.5);
+      for (final c in [1, 5, 2]) {
+        // inches, cm, feet
+        final mpu = millimetersPerUnit(c);
+        final h = findHoles(_dxf!, holeDiaMm / mpu, 0.5 / mpu);
+        if (h.length > best.length) {
+          best = h;
+          bestCode = c;
+        }
+      }
+      final mpu = millimetersPerUnit(bestCode);
+      return (mpu <= 0 ? 1.0 : mpu, best, bestCode);
+    }
+    var mpu = millimetersPerUnit(_effectiveInsUnits());
+    if (mpu <= 0) mpu = 1.0;
+    return (mpu, findHoles(_dxf!, holeDiaMm / mpu, 0.5 / mpu), _effectiveInsUnits());
+  }
+
+  String _unitCodeName(int c) => switch (c) {
+        1 => 'inches',
+        2 => 'feet',
+        4 => 'mm',
+        5 => 'cm',
+        6 => 'm',
+        _ => 'units',
+      };
+
   void _detect() {
     // Build hole centres (in node-mm) from whichever source is loaded.
     final centres = <Node>[];
+    var unitNote = '';
     if (_dxf != null) {
-      final holeDia = _mmToDrawing(_holeDiaMm);
-      final tol = _mmToDrawing(0.5);
-      final holes = findHoles(_dxf!, holeDia, tol);
-      var mmPerUnit = millimetersPerUnit(_effectiveInsUnits());
-      if (mmPerUnit <= 0) mmPerUnit = 1.0;
+      final (mmPerUnit, holes, unitCode) = _dxfDetect(_holeDiaMm);
+      if (_units == 0 && _dxf!.insUnits == 0 && holes.isNotEmpty) {
+        unitNote = ' (auto: ${_unitCodeName(unitCode)})';
+      }
       for (final h in holes) {
         centres.add(Node(h.x * mmPerUnit, h.y * mmPerUnit, radius: _holeDiaMm / 2));
       }
@@ -169,8 +197,9 @@ class _HomePageState extends State<HomePage> {
       _selection.clear();
       _strokeAdded.clear();
       _status = model.nodeCount == 0
-          ? 'No ~${_holeDiaMm.round()}mm holes found.'
-          : 'Found ${model.nodeCount} holes (~${_holeDiaMm.round()}mm). '
+          ? 'No ~${_holeDiaMm.round()}mm holes found. '
+              'If the file is unitless, try the Units dropdown.'
+          : 'Found ${model.nodeCount} holes (~${_holeDiaMm.round()}mm)$unitNote. '
               'Click a hole to set the start, then Auto Wire.';
     });
   }

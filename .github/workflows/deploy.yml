@@ -26,7 +26,9 @@ jobs:
           channel: stable
       - run: flutter pub get
       # base-href must match the project-page path (https://<user>.github.io/xmodelgen_flutter/).
-      - run: flutter build web --release --base-href /xmodelgen_flutter/
+      # --pwa-strategy=none skips the service worker so a new deploy isn't hidden by
+      # a stale cached copy in the browser.
+      - run: flutter build web --release --base-href /xmodelgen_flutter/ --pwa-strategy=none
       - uses: actions/upload-pages-artifact@v3
         with:
           path: build/web
