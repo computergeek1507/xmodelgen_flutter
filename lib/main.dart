@@ -45,6 +45,8 @@ class _HomePageState extends State<HomePage> {
   final _holeDiaCtrl = TextEditingController(text: '12');
   final _wireGapCtrl = TextEditingController(text: '100');
   int _startIndex = -1;
+  // Drawing-units override: 0 Auto (file), 1 mm, 2 cm, 3 in, 4 ft, 5 m.
+  int _units = 0;
   WireStrategy _strategy = WireStrategy.nearestFirst;
   _InteractMode _mode = _InteractMode.pickStart;
   final Set<int> _selection = {}; // section-mode selected node indices
@@ -65,8 +67,27 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  // The DXF units code to use for conversions: the file's $INSUNITS, unless the
+  // Units dropdown overrides it (e.g. for unitless files actually drawn in inches).
+  int _effectiveInsUnits() {
+    switch (_units) {
+      case 1:
+        return 4; // mm
+      case 2:
+        return 5; // cm
+      case 3:
+        return 1; // inches
+      case 4:
+        return 2; // feet
+      case 5:
+        return 6; // meters
+      default:
+        return _dxf?.insUnits ?? 0;
+    }
+  }
+
   double _mmToDrawing(double mm) {
-    final f = _dxf == null ? 0.0 : millimetersPerUnit(_dxf!.insUnits);
+    final f = millimetersPerUnit(_effectiveInsUnits());
     return f <= 0 ? mm : mm / f; // mm -> drawing units
   }
 
@@ -122,7 +143,7 @@ class _HomePageState extends State<HomePage> {
       final holeDia = _mmToDrawing(_holeDiaMm);
       final tol = _mmToDrawing(0.5);
       final holes = findHoles(_dxf!, holeDia, tol);
-      var mmPerUnit = millimetersPerUnit(_dxf!.insUnits);
+      var mmPerUnit = millimetersPerUnit(_effectiveInsUnits());
       if (mmPerUnit <= 0) mmPerUnit = 1.0;
       for (final h in holes) {
         centres.add(Node(h.x * mmPerUnit, h.y * mmPerUnit, radius: _holeDiaMm / 2));
@@ -367,6 +388,7 @@ class _HomePageState extends State<HomePage> {
               icon: const Icon(Icons.image_outlined),
               label: const Text('Open SVG')),
           _numberField('Hole Ø (mm)', _holeDiaCtrl, onSubmit: _detect),
+          _unitsDropdown(),
           _numberField('Wire gap (mm)', _wireGapCtrl),
           _strategyDropdown(),
           _modeDropdown(),
@@ -393,6 +415,37 @@ class _HomePageState extends State<HomePage> {
               icon: const Icon(Icons.save_alt),
               label: const Text('Export xModel')),
         ],
+      ),
+    );
+  }
+
+  Widget _unitsDropdown() {
+    const labels = [
+      'Auto (file)',
+      'Millimeters',
+      'Centimeters',
+      'Inches',
+      'Feet',
+      'Meters',
+    ];
+    return SizedBox(
+      width: 150,
+      child: DropdownButtonFormField<int>(
+        initialValue: _units,
+        isExpanded: true,
+        decoration: const InputDecoration(
+            labelText: 'Units',
+            isDense: true,
+            border: OutlineInputBorder()),
+        items: [
+          for (var i = 0; i < labels.length; i++)
+            DropdownMenuItem(value: i, child: Text(labels[i])),
+        ],
+        onChanged: (v) {
+          setState(() => _units = v ?? _units);
+          // Re-interpret the loaded DXF at the new units (_detect calls setState).
+          if (_dxf != null) _detect();
+        },
       ),
     );
   }
