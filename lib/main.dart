@@ -1,6 +1,8 @@
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 
 import 'src/auto_wire.dart';
@@ -55,6 +57,12 @@ class _HomePageState extends State<HomePage> {
   Offset? _dragStart; // section rubber-band, local widget coords
   Offset? _dragCurrent;
   final List<Offset> _lassoPoints = []; // freeform lasso path, local widget coords
+  // View transform (screen = scene * _viewScale + _viewOffset). Reset to fit when a
+  // model loads; the mouse wheel zooms toward the cursor.
+  double _viewScale = 1;
+  Offset _viewOffset = Offset.zero;
+  double _fitScale = 1; // scale of the fit-to-window view, for clamping zoom
+  bool _needFit = true;
   String _status = 'Open a DXF to begin.';
 
   // Read the fields live so Auto Wire / detect always use what's in the box,
@@ -198,6 +206,7 @@ class _HomePageState extends State<HomePage> {
       _startIndex = -1;
       _selection.clear();
       _strokeAdded.clear();
+      _needFit = true; // fit the freshly detected model to the view
       _status = model.nodeCount == 0
           ? 'No ~${_holeDiaMm.round()}mm holes found. '
               'If the file is unitless, try the Units dropdown.'
@@ -586,10 +595,42 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // Fit-to-window transform (screen = scene * scale + offset) for the current model.
+  ({double scale, Offset offset}) _computeFit(Size size) {
+    if (_model.nodeCount == 0) return (scale: 1, offset: Offset.zero);
+    var minx = _model.nodes.first.x, maxx = minx;
+    var miny = -_model.nodes.first.y, maxy = miny;
+    for (final n in _model.nodes) {
+      minx = math.min(minx, n.x);
+      maxx = math.max(maxx, n.x);
+      final sy = -n.y;
+      miny = math.min(miny, sy);
+      maxy = math.max(maxy, sy);
+    }
+    const pad = 24.0;
+    final spanX = (maxx - minx).abs() < 1e-6 ? 1.0 : maxx - minx;
+    final spanY = (maxy - miny).abs() < 1e-6 ? 1.0 : maxy - miny;
+    final sx = (size.width - pad * 2) / spanX;
+    final sy = (size.height - pad * 2) / spanY;
+    final s = sx < sy ? sx : sy;
+    return (scale: s, offset: Offset(pad - minx * s, pad - miny * s));
+  }
+
   Widget _canvas() {
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = constraints.biggest;
+        // Fit the model to the view once after it loads; the wheel then zooms.
+        if (_needFit &&
+            _model.nodeCount > 0 &&
+            size.width > 0 &&
+            size.height > 0) {
+          final fit = _computeFit(size);
+          _viewScale = fit.scale;
+          _viewOffset = fit.offset;
+          _fitScale = fit.scale;
+          _needFit = false;
+        }
         final painter = _NodePainter(
           _model,
           _mode == _InteractMode.pickStart ? _startIndex : -1,
@@ -597,10 +638,12 @@ class _HomePageState extends State<HomePage> {
           _dragStart,
           _dragCurrent,
           _lassoPoints,
+          _viewScale,
+          _viewOffset,
         );
 
         void onTap(Offset local) {
-          final scene = painter.toScene(local, size);
+          final scene = painter.toScene(local);
           if (scene == null) return;
           final idx = _nearestIndex(scene);
           if (idx < 0) return;
@@ -617,7 +660,21 @@ class _HomePageState extends State<HomePage> {
           }
         }
 
-        return GestureDetector(
+        return Listener(
+          // Mouse wheel: zoom in/out toward the cursor.
+          onPointerSignal: (e) {
+            if (e is PointerScrollEvent && _viewScale > 0) {
+              final f = e.localPosition;
+              final m = math.pow(1.0015, -e.scrollDelta.dy).toDouble();
+              final ns = (_viewScale * m).clamp(_fitScale * 0.1, _fitScale * 50.0);
+              final am = ns / _viewScale; // actual multiplier after clamping
+              setState(() {
+                _viewScale = ns;
+                _viewOffset = f - (f - _viewOffset) * am;
+              });
+            }
+          },
+          child: GestureDetector(
           onTapUp: (d) => onTap(d.localPosition),
           onSecondaryTapUp: (_) {
             if (_mode == _InteractMode.manual) _undoLast();
@@ -636,7 +693,7 @@ class _HomePageState extends State<HomePage> {
               });
             } else if (_mode == _InteractMode.manual) {
               _strokeAdded.clear();
-              final scene = painter.toScene(d.localPosition, size);
+              final scene = painter.toScene(d.localPosition);
               if (scene != null) _manualAdd(_nearestIndex(scene));
             }
           },
@@ -646,7 +703,7 @@ class _HomePageState extends State<HomePage> {
             } else if (_mode == _InteractMode.lasso) {
               setState(() => _lassoPoints.add(d.localPosition));
             } else if (_mode == _InteractMode.manual) {
-              final scene = painter.toScene(d.localPosition, size);
+              final scene = painter.toScene(d.localPosition);
               if (scene != null) {
                 final idx = _nearestIndex(scene);
                 if (idx >= 0 && !_strokeAdded.contains(idx)) _manualAdd(idx);
@@ -657,8 +714,8 @@ class _HomePageState extends State<HomePage> {
             if (_mode == _InteractMode.section &&
                 _dragStart != null &&
                 _dragCurrent != null) {
-              final a = painter.toScene(_dragStart!, size);
-              final b = painter.toScene(_dragCurrent!, size);
+              final a = painter.toScene(_dragStart!);
+              final b = painter.toScene(_dragCurrent!);
               setState(() {
                 if (a != null && b != null) {
                   final rect = Rect.fromPoints(a, b);
@@ -676,7 +733,7 @@ class _HomePageState extends State<HomePage> {
               // Convert the freeform path to scene coords and select enclosed nodes.
               final poly = <Offset>[];
               for (final p in _lassoPoints) {
-                final s = painter.toScene(p, size);
+                final s = painter.toScene(p);
                 if (s != null) poly.add(s);
               }
               setState(() {
@@ -695,6 +752,7 @@ class _HomePageState extends State<HomePage> {
             }
           },
           child: CustomPaint(size: size, painter: painter),
+          ),
         );
       },
     );
@@ -704,63 +762,33 @@ class _HomePageState extends State<HomePage> {
 class _NodePainter extends CustomPainter {
   _NodePainter(
       this.model, this.startIndex, this.selection, this.dragStart, this.dragCurrent,
-      this.lassoPoints);
+      this.lassoPoints, this.scale, this.offset);
   final Model model;
   final int startIndex;
   final Set<int> selection;
   final Offset? dragStart; // section rubber-band, local widget coords
   final Offset? dragCurrent;
   final List<Offset> lassoPoints; // freeform lasso path, local widget coords
+  final double scale; // screen = scene * scale + offset
+  final Offset offset;
 
-  double _scale = 1;
-  double _ox = 0;
-  double _oy = 0;
-  bool _ready = false;
-
-  void _computeTransform(Size size) {
-    if (model.nodeCount == 0) {
-      _ready = false;
-      return;
-    }
-    var minx = model.nodes.first.x, maxx = minx;
-    var miny = -model.nodes.first.y, maxy = miny;
-    for (final n in model.nodes) {
-      minx = minx < n.x ? minx : n.x;
-      maxx = maxx > n.x ? maxx : n.x;
-      final sy = -n.y;
-      miny = miny < sy ? miny : sy;
-      maxy = maxy > sy ? maxy : sy;
-    }
-    const pad = 24.0;
-    final spanX = (maxx - minx).abs() < 1e-6 ? 1.0 : maxx - minx;
-    final spanY = (maxy - miny).abs() < 1e-6 ? 1.0 : maxy - miny;
-    final sx = (size.width - pad * 2) / spanX;
-    final sy = (size.height - pad * 2) / spanY;
-    _scale = sx < sy ? sx : sy;
-    _ox = pad - minx * _scale;
-    _oy = pad - miny * _scale;
-    _ready = true;
-  }
-
-  Offset? toScene(Offset local, Size size) {
-    _computeTransform(size);
-    if (!_ready) return null;
-    return Offset((local.dx - _ox) / _scale, (local.dy - _oy) / _scale);
+  Offset? toScene(Offset local) {
+    if (model.nodeCount == 0 || scale == 0) return null;
+    return Offset((local.dx - offset.dx) / scale, (local.dy - offset.dy) / scale);
   }
 
   @override
   void paint(Canvas canvas, Size size) {
-    _computeTransform(size);
-    if (!_ready) return;
+    if (model.nodeCount == 0 || scale == 0) return;
 
     final pen = Paint()
       ..style = PaintingStyle.stroke
       ..color = Colors.black54;
     for (var i = 0; i < model.nodeCount; i++) {
       final n = model.nodes[i];
-      final cx = n.x * _scale + _ox;
-      final cy = (-n.y) * _scale + _oy;
-      final r = (n.radius * _scale).clamp(2.0, 1000.0);
+      final cx = n.x * scale + offset.dx;
+      final cy = (-n.y) * scale + offset.dy;
+      final r = (n.radius * scale).clamp(2.0, 1000.0);
 
       Color fill = Colors.amber;
       if (n.isWired) fill = const Color(0xFF5AAAFF);
