@@ -15,7 +15,8 @@ import 'src/svg_reader.dart';
 /// - [pickStart]: click a node to set the whole-model Auto Wire start.
 /// - [manual]: click or drag across nodes to wire them by hand.
 /// - [section]: drag a box (or click nodes) to select a group, then Wire Section.
-enum _InteractMode { pickStart, manual, section }
+/// - [lasso]: draw a freeform loop around nodes to select them, then Wire Section.
+enum _InteractMode { pickStart, manual, section, lasso }
 
 void main() => runApp(const XModelGenApp());
 
@@ -53,6 +54,7 @@ class _HomePageState extends State<HomePage> {
   final Set<int> _strokeAdded = {}; // nodes added during the current manual drag
   Offset? _dragStart; // section rubber-band, local widget coords
   Offset? _dragCurrent;
+  final List<Offset> _lassoPoints = []; // freeform lasso path, local widget coords
   String _status = 'Open a DXF to begin.';
 
   // Read the fields live so Auto Wire / detect always use what's in the box,
@@ -370,7 +372,26 @@ class _HomePageState extends State<HomePage> {
         _InteractMode.pickStart => 'Pick start',
         _InteractMode.manual => 'Manual wire',
         _InteractMode.section => 'Select section',
+        _InteractMode.lasso => 'Lasso select',
       };
+
+  // Modes that build a node selection for Wire Section.
+  bool get _isSelectMode =>
+      _mode == _InteractMode.section || _mode == _InteractMode.lasso;
+
+  // Ray-casting point-in-polygon test (all coordinates in the same space).
+  static bool _pointInPolygon(Offset p, List<Offset> poly) {
+    var inside = false;
+    for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      final xi = poly[i].dx, yi = poly[i].dy;
+      final xj = poly[j].dx, yj = poly[j].dy;
+      if (((yi > p.dy) != (yj > p.dy)) &&
+          (p.dx < (xj - xi) * (p.dy - yi) / (yj - yi) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -426,9 +447,7 @@ class _HomePageState extends State<HomePage> {
               icon: const Icon(Icons.timeline),
               label: const Text('Auto Wire')),
           FilledButton.icon(
-              onPressed: (_mode == _InteractMode.section && _selection.isNotEmpty)
-                  ? _wireSection
-                  : null,
+              onPressed: (_isSelectMode && _selection.isNotEmpty) ? _wireSection : null,
               icon: const Icon(Icons.cable),
               label: const Text('Wire Section')),
           OutlinedButton.icon(
@@ -496,13 +515,16 @@ class _HomePageState extends State<HomePage> {
               value: _InteractMode.manual, child: Text('Manual wire')),
           DropdownMenuItem(
               value: _InteractMode.section, child: Text('Select section')),
+          DropdownMenuItem(
+              value: _InteractMode.lasso, child: Text('Lasso select')),
         ],
         onChanged: (v) => setState(() {
           _mode = v ?? _mode;
           _strokeAdded.clear();
           _dragStart = null;
           _dragCurrent = null;
-          if (_mode != _InteractMode.section) _selection.clear();
+          _lassoPoints.clear();
+          if (!_isSelectMode) _selection.clear();
           _status = '${_modeName(_mode)} mode.';
         }),
       ),
@@ -574,6 +596,7 @@ class _HomePageState extends State<HomePage> {
           _selection,
           _dragStart,
           _dragCurrent,
+          _lassoPoints,
         );
 
         void onTap(Offset local) {
@@ -587,6 +610,7 @@ class _HomePageState extends State<HomePage> {
             case _InteractMode.manual:
               _manualAdd(idx);
             case _InteractMode.section:
+            case _InteractMode.lasso:
               setState(() => _selection.contains(idx)
                   ? _selection.remove(idx)
                   : _selection.add(idx));
@@ -604,6 +628,12 @@ class _HomePageState extends State<HomePage> {
                 _dragStart = d.localPosition;
                 _dragCurrent = d.localPosition;
               });
+            } else if (_mode == _InteractMode.lasso) {
+              setState(() {
+                _lassoPoints
+                  ..clear()
+                  ..add(d.localPosition);
+              });
             } else if (_mode == _InteractMode.manual) {
               _strokeAdded.clear();
               final scene = painter.toScene(d.localPosition, size);
@@ -613,6 +643,8 @@ class _HomePageState extends State<HomePage> {
           onPanUpdate: (d) {
             if (_mode == _InteractMode.section) {
               setState(() => _dragCurrent = d.localPosition);
+            } else if (_mode == _InteractMode.lasso) {
+              setState(() => _lassoPoints.add(d.localPosition));
             } else if (_mode == _InteractMode.manual) {
               final scene = painter.toScene(d.localPosition, size);
               if (scene != null) {
@@ -622,26 +654,45 @@ class _HomePageState extends State<HomePage> {
             }
           },
           onPanEnd: (_) {
-            if (_mode != _InteractMode.section ||
-                _dragStart == null ||
-                _dragCurrent == null) {
-              return;
-            }
-            final a = painter.toScene(_dragStart!, size);
-            final b = painter.toScene(_dragCurrent!, size);
-            setState(() {
-              if (a != null && b != null) {
-                final rect = Rect.fromPoints(a, b);
-                _selection.clear();
-                for (var i = 0; i < _model.nodeCount; i++) {
-                  final n = _model.nodes[i];
-                  if (rect.contains(Offset(n.x, -n.y))) _selection.add(i);
+            if (_mode == _InteractMode.section &&
+                _dragStart != null &&
+                _dragCurrent != null) {
+              final a = painter.toScene(_dragStart!, size);
+              final b = painter.toScene(_dragCurrent!, size);
+              setState(() {
+                if (a != null && b != null) {
+                  final rect = Rect.fromPoints(a, b);
+                  _selection.clear();
+                  for (var i = 0; i < _model.nodeCount; i++) {
+                    final n = _model.nodes[i];
+                    if (rect.contains(Offset(n.x, -n.y))) _selection.add(i);
+                  }
+                  _status = '${_selection.length} node(s) selected.';
                 }
-                _status = '${_selection.length} node(s) selected.';
+                _dragStart = null;
+                _dragCurrent = null;
+              });
+            } else if (_mode == _InteractMode.lasso && _lassoPoints.length >= 3) {
+              // Convert the freeform path to scene coords and select enclosed nodes.
+              final poly = <Offset>[];
+              for (final p in _lassoPoints) {
+                final s = painter.toScene(p, size);
+                if (s != null) poly.add(s);
               }
-              _dragStart = null;
-              _dragCurrent = null;
-            });
+              setState(() {
+                if (poly.length >= 3) {
+                  _selection.clear();
+                  for (var i = 0; i < _model.nodeCount; i++) {
+                    final n = _model.nodes[i];
+                    if (_pointInPolygon(Offset(n.x, -n.y), poly)) _selection.add(i);
+                  }
+                  _status = '${_selection.length} node(s) selected.';
+                }
+                _lassoPoints.clear();
+              });
+            } else {
+              setState(() => _lassoPoints.clear());
+            }
           },
           child: CustomPaint(size: size, painter: painter),
         );
@@ -652,12 +703,14 @@ class _HomePageState extends State<HomePage> {
 
 class _NodePainter extends CustomPainter {
   _NodePainter(
-      this.model, this.startIndex, this.selection, this.dragStart, this.dragCurrent);
+      this.model, this.startIndex, this.selection, this.dragStart, this.dragCurrent,
+      this.lassoPoints);
   final Model model;
   final int startIndex;
   final Set<int> selection;
   final Offset? dragStart; // section rubber-band, local widget coords
   final Offset? dragCurrent;
+  final List<Offset> lassoPoints; // freeform lasso path, local widget coords
 
   double _scale = 1;
   double _ox = 0;
@@ -736,6 +789,18 @@ class _NodePainter extends CustomPainter {
           rect,
           Paint()
             ..style = PaintingStyle.stroke
+            ..color = const Color(0xFFFF9628));
+    }
+
+    // Live freeform lasso path (drawn directly in widget coords).
+    if (lassoPoints.length >= 2) {
+      final path = Path()..addPolygon(lassoPoints, true);
+      canvas.drawPath(path, Paint()..color = const Color(0x28FF9628));
+      canvas.drawPath(
+          path,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.5
             ..color = const Color(0xFFFF9628));
     }
   }
