@@ -65,6 +65,7 @@ class _HomePageState extends State<HomePage> {
   double _fitScale = 1; // scale of the fit-to-window view, for clamping zoom
   bool _needFit = true;
   bool _panning = false; // a Shift-drag pan is in progress
+  bool _middlePanning = false; // a middle-button drag pan is in progress
 
   // Hold Shift while dragging to pan the view (instead of selecting/wiring).
   bool get _panModifier => HardwareKeyboard.instance.isShiftPressed;
@@ -679,6 +680,16 @@ class _HomePageState extends State<HomePage> {
               });
             }
           },
+          // Middle-button drag: pan the view (the gesture detector below only
+          // handles the primary button, so middle drags come through here).
+          onPointerDown: (e) {
+            if ((e.buttons & kMiddleMouseButton) != 0) _middlePanning = true;
+          },
+          onPointerMove: (e) {
+            if (_middlePanning) setState(() => _viewOffset += e.delta);
+          },
+          onPointerUp: (_) => _middlePanning = false,
+          onPointerCancel: (_) => _middlePanning = false,
           child: GestureDetector(
           onTapUp: (d) => onTap(d.localPosition),
           onSecondaryTapUp: (_) {
