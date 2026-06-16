@@ -19,7 +19,8 @@ import 'src/svg_reader.dart';
 /// - [manual]: click or drag across nodes to wire them by hand.
 /// - [section]: drag a box (or click nodes) to select a group, then Wire Section.
 /// - [lasso]: draw a freeform loop around nodes to select them, then Wire Section.
-enum _InteractMode { pickStart, manual, section, lasso }
+/// - [measure]: click two nodes to read the straight-line distance between them.
+enum _InteractMode { pickStart, manual, section, lasso, measure }
 
 void main() => runApp(const XModelGenApp());
 
@@ -55,6 +56,9 @@ class _HomePageState extends State<HomePage> {
   _InteractMode _mode = _InteractMode.pickStart;
   final Set<int> _selection = {}; // section-mode selected node indices
   final Set<int> _strokeAdded = {}; // nodes added during the current manual drag
+  int _measureA = -1; // first node picked in measure mode
+  int _measureB = -1; // second node picked in measure mode
+  bool _showWires = true; // draw wire segments between numbered nodes
   Offset? _dragStart; // section rubber-band, local widget coords
   Offset? _dragCurrent;
   final List<Offset> _lassoPoints = []; // freeform lasso path, local widget coords
@@ -383,11 +387,36 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  // Pick a node in measure mode: first click sets A, second sets B and reports
+  // the distance, a third click starts a fresh measurement from the new node.
+  void _measurePick(int idx) {
+    if (idx < 0 || idx >= _model.nodeCount) return;
+    setState(() {
+      if (_measureA < 0 || _measureB >= 0) {
+        _measureA = idx;
+        _measureB = -1;
+        _status = 'Measure: pick a second node.';
+      } else if (idx == _measureA) {
+        _status = 'Measure: pick a different second node.';
+      } else {
+        _measureB = idx;
+        final a = _model.nodes[_measureA];
+        final b = _model.nodes[idx];
+        final dx = a.x - b.x;
+        final dy = a.y - b.y;
+        final dist = math.sqrt(dx * dx + dy * dy);
+        _status = 'Distance: ${dist.toStringAsFixed(1)} mm '
+            '(Δx ${dx.abs().toStringAsFixed(1)}, Δy ${dy.abs().toStringAsFixed(1)}).';
+      }
+    });
+  }
+
   String _modeName(_InteractMode m) => switch (m) {
         _InteractMode.pickStart => 'Pick start',
         _InteractMode.manual => 'Manual wire',
         _InteractMode.section => 'Select section',
         _InteractMode.lasso => 'Lasso select',
+        _InteractMode.measure => 'Measure',
       };
 
   // Modes that build a node selection for Wire Section.
@@ -457,6 +486,7 @@ class _HomePageState extends State<HomePage> {
           _numberField('Wire gap (mm)', _wireGapCtrl),
           _strategyDropdown(),
           _modeDropdown(),
+          _showWiresCheckbox(),
           FilledButton.icon(
               onPressed: _model.nodeCount == 0 ? null : _autoWire,
               icon: const Icon(Icons.timeline),
@@ -532,6 +562,8 @@ class _HomePageState extends State<HomePage> {
               value: _InteractMode.section, child: Text('Select section')),
           DropdownMenuItem(
               value: _InteractMode.lasso, child: Text('Lasso select')),
+          DropdownMenuItem(
+              value: _InteractMode.measure, child: Text('Measure')),
         ],
         onChanged: (v) => setState(() {
           _mode = v ?? _mode;
@@ -539,9 +571,29 @@ class _HomePageState extends State<HomePage> {
           _dragStart = null;
           _dragCurrent = null;
           _lassoPoints.clear();
+          _measureA = -1;
+          _measureB = -1;
           if (!_isSelectMode) _selection.clear();
-          _status = '${_modeName(_mode)} mode.';
+          _status = _mode == _InteractMode.measure
+              ? 'Measure: click a node, then a second to read the distance.'
+              : '${_modeName(_mode)} mode.';
         }),
+      ),
+    );
+  }
+
+  Widget _showWiresCheckbox() {
+    return InkWell(
+      onTap: () => setState(() => _showWires = !_showWires),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Checkbox(
+            value: _showWires,
+            onChanged: (v) => setState(() => _showWires = v ?? _showWires),
+          ),
+          const Text('Show wires'),
+        ],
       ),
     );
   }
@@ -644,6 +696,10 @@ class _HomePageState extends State<HomePage> {
           _dragStart,
           _dragCurrent,
           _lassoPoints,
+          _mode == _InteractMode.measure ? _measureA : -1,
+          _mode == _InteractMode.measure ? _measureB : -1,
+          _wireGapMm,
+          _showWires,
           _viewScale,
           _viewOffset,
         );
@@ -663,6 +719,8 @@ class _HomePageState extends State<HomePage> {
               setState(() => _selection.contains(idx)
                   ? _selection.remove(idx)
                   : _selection.add(idx));
+            case _InteractMode.measure:
+              _measurePick(idx);
           }
         }
 
@@ -784,15 +842,26 @@ class _HomePageState extends State<HomePage> {
 class _NodePainter extends CustomPainter {
   _NodePainter(
       this.model, this.startIndex, this.selection, this.dragStart, this.dragCurrent,
-      this.lassoPoints, this.scale, this.offset);
+      this.lassoPoints, this.measureA, this.measureB, this.wireGapMm,
+      this.showWires, this.scale, this.offset);
   final Model model;
   final int startIndex;
   final Set<int> selection;
   final Offset? dragStart; // section rubber-band, local widget coords
   final Offset? dragCurrent;
   final List<Offset> lassoPoints; // freeform lasso path, local widget coords
+  final int measureA; // measure-mode endpoints (-1 when unset)
+  final int measureB;
+  final double wireGapMm; // segments longer than this are drawn red
+  final bool showWires; // whether to draw the wire run between numbered nodes
   final double scale; // screen = scene * scale + offset
   final Offset offset;
+
+  // Screen position of a node's marker centre.
+  Offset _screen(int i) {
+    final n = model.nodes[i];
+    return Offset(n.x * scale + offset.dx, (-n.y) * scale + offset.dy);
+  }
 
   Offset? toScene(Offset local) {
     if (model.nodeCount == 0 || scale == 0) return null;
@@ -802,6 +871,37 @@ class _NodePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (model.nodeCount == 0 || scale == 0) return;
+
+    // Wire run: connect consecutively numbered nodes. A segment longer than the
+    // wire gap is drawn red so over-length hops stand out; others are blue.
+    final byNumber = <int, int>{}; // nodeNumber -> node index
+    for (var i = 0; i < model.nodeCount; i++) {
+      final num = model.nodes[i].nodeNumber;
+      if (num > 0) byNumber[num] = i;
+    }
+    if (showWires && byNumber.length > 1) {
+      final maxNum =
+          byNumber.keys.reduce((a, b) => a > b ? a : b);
+      final okPen = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5
+        ..color = const Color(0xFF5AAAFF);
+      final overPen = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0
+        ..color = const Color(0xFFEF3030);
+      for (var num = 1; num < maxNum; num++) {
+        final ai = byNumber[num];
+        final bi = byNumber[num + 1];
+        if (ai == null || bi == null) continue; // skip gaps in the numbering
+        final a = model.nodes[ai];
+        final b = model.nodes[bi];
+        final len =
+            math.sqrt(math.pow(a.x - b.x, 2) + math.pow(a.y - b.y, 2));
+        canvas.drawLine(
+            _screen(ai), _screen(bi), len > wireGapMm ? overPen : okPen);
+      }
+    }
 
     final pen = Paint()
       ..style = PaintingStyle.stroke
@@ -816,6 +916,7 @@ class _NodePainter extends CustomPainter {
       if (n.isWired) fill = const Color(0xFF5AAAFF);
       if (i == startIndex) fill = const Color(0xFF28C850);
       if (selection.contains(i)) fill = const Color(0xFFFF9628); // section selection
+      if (i == measureA || i == measureB) fill = const Color(0xFFE040FB); // measure
 
       canvas.drawCircle(Offset(cx, cy), r, Paint()..color = fill);
       canvas.drawCircle(Offset(cx, cy), r, pen);
@@ -829,6 +930,35 @@ class _NodePainter extends CustomPainter {
         )..layout();
         tp.paint(canvas, Offset(cx + r, cy - r - tp.height));
       }
+    }
+
+    // Measure line + distance label between the two picked endpoints.
+    if (measureA >= 0 &&
+        measureB >= 0 &&
+        measureA < model.nodeCount &&
+        measureB < model.nodeCount) {
+      final pa = _screen(measureA);
+      final pb = _screen(measureB);
+      canvas.drawLine(
+          pa,
+          pb,
+          Paint()
+            ..color = const Color(0xFFE040FB)
+            ..strokeWidth = 1.5);
+      final a = model.nodes[measureA];
+      final b = model.nodes[measureB];
+      final dist = math.sqrt(math.pow(a.x - b.x, 2) + math.pow(a.y - b.y, 2));
+      final tp = TextPainter(
+        text: TextSpan(
+            text: '${dist.toStringAsFixed(1)} mm',
+            style: const TextStyle(
+                color: Color(0xFFC51FD6),
+                fontSize: 12,
+                fontWeight: FontWeight.bold)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final mid = (pa + pb) / 2;
+      tp.paint(canvas, mid - Offset(tp.width / 2, tp.height + 2));
     }
 
     // Live section rubber-band (drawn directly in widget coords).
