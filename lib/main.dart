@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
@@ -20,7 +21,7 @@ import 'src/svg_reader.dart';
 /// - [section]: drag a box (or click nodes) to select a group, then Wire Section.
 /// - [lasso]: draw a freeform loop around nodes to select them, then Wire Section.
 /// - [measure]: click two nodes to read the straight-line distance between them.
-enum _InteractMode { pickStart, manual, section, lasso, measure }
+enum _InteractMode { pickStart, manual, section, lasso, measure, addNode, lassoErase }
 
 void main() => runApp(const XModelGenApp());
 
@@ -46,6 +47,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   DxfData? _dxf;
   List<SvgCircle> _svgCircles = []; // active when loaded from SVG
+  ui.Image? _bgImage; // raster backdrop (PNG/JPEG) for manual node placement
   Model _model = Model();
   final _holeDiaCtrl = TextEditingController(text: '12');
   final _wireGapCtrl = TextEditingController(text: '100');
@@ -62,6 +64,7 @@ class _HomePageState extends State<HomePage> {
   Offset? _dragStart; // section rubber-band, local widget coords
   Offset? _dragCurrent;
   final List<Offset> _lassoPoints = []; // freeform lasso path, local widget coords
+  Offset? _hoverLocal; // last mouse position over the canvas, for keyboard actions
   // View transform (screen = scene * _viewScale + _viewOffset). Reset to fit when a
   // model loads; the mouse wheel zooms toward the cursor.
   double _viewScale = 1;
@@ -70,9 +73,12 @@ class _HomePageState extends State<HomePage> {
   bool _needFit = true;
   bool _panning = false; // a Shift-drag pan is in progress
   bool _middlePanning = false; // a middle-button drag pan is in progress
+  bool _unwiring = false; // a Ctrl-drag unwire is in progress
 
   // Hold Shift while dragging to pan the view (instead of selecting/wiring).
   bool get _panModifier => HardwareKeyboard.instance.isShiftPressed;
+  // Hold Ctrl to unwire nodes by clicking or dragging across them.
+  bool get _unwireModifier => HardwareKeyboard.instance.isControlPressed;
   String _status = 'Open a DXF to begin.';
 
   // Read the fields live so Auto Wire / detect always use what's in the box,
@@ -121,6 +127,7 @@ class _HomePageState extends State<HomePage> {
 
     _dxf = parseDxf(text);
     _svgCircles = []; // DXF is now the active source
+    _bgImage = null;
     _model.name =
         file.name.replaceAll(RegExp(r'\.dxf$', caseSensitive: false), '');
     _detect();
@@ -146,9 +153,114 @@ class _HomePageState extends State<HomePage> {
     }
     _svgCircles = circles;
     _dxf = null; // SVG is now the active source
+    _bgImage = null;
     _model.name =
         file.name.replaceAll(RegExp(r'\.svg$', caseSensitive: false), '');
     _detect();
+  }
+
+  // Open a PNG/JPEG as a backdrop, then place nodes on it by hand (Add node mode)
+  // or auto-detect bright/dark spots. Image pixels map straight to scene units.
+  Future<void> _openImage() async {
+    final result = await FilePicker.pickFiles(
+      dialogTitle: 'Open image',
+      type: FileType.custom,
+      allowedExtensions: ['png', 'jpg', 'jpeg'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    final bytes = file.bytes;
+    if (bytes == null) return;
+    final ui.Image image;
+    try {
+      final codec = await ui.instantiateImageCodec(bytes);
+      image = (await codec.getNextFrame()).image;
+    } catch (_) {
+      setState(() => _status = 'Could not decode that image.');
+      return;
+    }
+    setState(() {
+      _bgImage = image;
+      _dxf = null;
+      _svgCircles = [];
+      _model = Model()
+        ..name = file.name
+            .replaceAll(RegExp(r'\.(png|jpe?g)$', caseSensitive: false), '');
+      _startIndex = -1;
+      _selection.clear();
+      _strokeAdded.clear();
+      _measureA = -1;
+      _measureB = -1;
+      _mode = _InteractMode.addNode;
+      _needFit = true;
+      _status = 'Image loaded (${image.width}×${image.height}). Click to add '
+          'nodes, Ctrl-click to remove, or use Auto-detect.';
+    });
+  }
+
+  // Scan the loaded image for bright (or dark) blobs and drop a node at the
+  // centroid of each, on top of any nodes already placed.
+  Future<void> _autoDetectSpots({required bool bright}) async {
+    final image = _bgImage;
+    if (image == null) return;
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) {
+      setState(() => _status = 'Could not read image pixels.');
+      return;
+    }
+    final w = image.width, h = image.height;
+    final px = data.buffer.asUint8List();
+    // Threshold on luminance; "bright" keeps light spots, otherwise dark spots.
+    final mask = Uint8List(w * h);
+    for (var i = 0; i < w * h; i++) {
+      final o = i * 4;
+      final lum = 0.299 * px[o] + 0.587 * px[o + 1] + 0.114 * px[o + 2];
+      final hit = bright ? lum > 180 : lum < 75;
+      mask[i] = hit ? 1 : 0;
+    }
+    // Flood-fill connected components, taking each as one candidate spot.
+    final visited = Uint8List(w * h);
+    final spots = <Offset>[];
+    final minArea = math.max(4, (w * h) ~/ 200000); // ignore specks
+    final stack = <int>[];
+    for (var start = 0; start < w * h; start++) {
+      if (mask[start] == 0 || visited[start] == 1) continue;
+      stack
+        ..clear()
+        ..add(start);
+      visited[start] = 1;
+      var area = 0;
+      var sx = 0.0, sy = 0.0;
+      while (stack.isNotEmpty) {
+        final p = stack.removeLast();
+        final cx = p % w, cy = p ~/ w;
+        area++;
+        sx += cx;
+        sy += cy;
+        for (final n in [p - 1, p + 1, p - w, p + w]) {
+          if (n < 0 || n >= w * h) continue;
+          // Skip horizontal wrap-around at row edges.
+          if ((n == p - 1 && cx == 0) || (n == p + 1 && cx == w - 1)) continue;
+          if (mask[n] == 1 && visited[n] == 0) {
+            visited[n] = 1;
+            stack.add(n);
+          }
+        }
+      }
+      if (area >= minArea) spots.add(Offset(sx / area, sy / area));
+    }
+    for (final s in spots) {
+      // Image pixel (sx, sy) -> scene (sx, sy) -> node (x, -y); see _addNodeAt.
+      _model.addNode(Node(s.dx, -s.dy, radius: 5));
+    }
+    setState(() {
+      _needFit = _model.nodeCount == spots.length; // first nodes: fit the view
+      _status = spots.isEmpty
+          ? 'No ${bright ? "bright" : "dark"} spots found.'
+          : 'Detected ${spots.length} ${bright ? "bright" : "dark"} spot(s). '
+              'Total ${_model.nodeCount} node(s).';
+    });
   }
 
   // Detect DXF holes, returning (mmPerUnit, holes, unitCode). For a unitless file
@@ -323,6 +435,65 @@ class _HomePageState extends State<HomePage> {
     setState(() => _status = 'Removed node $maxN.');
   }
 
+  // Remove the wiring of a single node (the one under the cursor), closing the
+  // numbering gap so the run stays continuous. Bound to Delete/Backspace.
+  void _removeWireAt(Offset? local, _NodePainter painter) {
+    if (local == null) return;
+    final scene = painter.toScene(local);
+    if (scene == null) return;
+    final idx = _nearestIndex(scene);
+    if (idx < 0) {
+      setState(() => _status = 'Nothing to unwire there.');
+      return;
+    }
+    if (!_unwireIndex(idx)) {
+      setState(() => _status = 'That node is not wired.');
+    }
+  }
+
+  // Unwire one node, closing the numbering gap. Returns false if it wasn't wired.
+  bool _unwireIndex(int idx) {
+    if (idx < 0 || idx >= _model.nodeCount) return false;
+    final num = _model.nodes[idx].nodeNumber;
+    if (!_model.removeFromWiring(idx)) return false;
+    _strokeAdded.remove(idx);
+    setState(() => _status = 'Removed node $num from the wiring.');
+    return true;
+  }
+
+  // Unwire the node under a scene point, but only if the point actually lands on
+  // it — so a Ctrl-click/drag across empty space doesn't unwire a distant node.
+  void _unwireSceneHit(Offset scene) {
+    final idx = _nearestIndex(scene);
+    if (idx < 0) return;
+    final n = _model.nodes[idx];
+    final dx = n.x - scene.dx, dy = -n.y - scene.dy;
+    final hitR = math.max(n.radius, 8.0);
+    if (dx * dx + dy * dy <= hitR * hitR) _unwireIndex(idx);
+  }
+
+  // Add-node mode: click empty space to drop a node; click an existing node
+  // (within its radius) to delete it instead.
+  void _addOrRemoveNodeAt(Offset scene) {
+    final idx = _nearestIndex(scene);
+    if (idx >= 0) {
+      final n = _model.nodes[idx];
+      final dx = n.x - scene.dx, dy = -n.y - scene.dy;
+      final hitR = math.max(n.radius, 6.0);
+      if (dx * dx + dy * dy <= hitR * hitR) {
+        _model.removeNode(idx);
+        setState(() {
+          if (_startIndex == idx) _startIndex = -1;
+          _status = 'Removed a node. ${_model.nodeCount} left.';
+        });
+        return;
+      }
+    }
+    // Scene (sx, sy) -> node (x, -y) so the marker lands under the cursor.
+    _model.addNode(Node(scene.dx, -scene.dy, radius: 5));
+    setState(() => _status = 'Added a node. ${_model.nodeCount} total.');
+  }
+
   // Auto-wire the current section selection, numbering on from the highest.
   void _wireSection() {
     final sel = _selection
@@ -417,6 +588,8 @@ class _HomePageState extends State<HomePage> {
         _InteractMode.section => 'Select section',
         _InteractMode.lasso => 'Lasso select',
         _InteractMode.measure => 'Measure',
+        _InteractMode.addNode => 'Add node',
+        _InteractMode.lassoErase => 'Lasso erase',
       };
 
   // Modes that build a node selection for Wire Section.
@@ -481,12 +654,26 @@ class _HomePageState extends State<HomePage> {
               onPressed: _openSvg,
               icon: const Icon(Icons.image_outlined),
               label: const Text('Open SVG')),
+          OutlinedButton.icon(
+              onPressed: _openImage,
+              icon: const Icon(Icons.photo),
+              label: const Text('Open Image')),
           _numberField('Hole Ø (mm)', _holeDiaCtrl, onSubmit: _detect),
           _unitsDropdown(),
           _numberField('Wire gap (mm)', _wireGapCtrl),
           _strategyDropdown(),
           _modeDropdown(),
           _showWiresCheckbox(),
+          OutlinedButton.icon(
+              onPressed:
+                  _bgImage == null ? null : () => _autoDetectSpots(bright: true),
+              icon: const Icon(Icons.lightbulb_outline),
+              label: const Text('Detect bright')),
+          OutlinedButton.icon(
+              onPressed:
+                  _bgImage == null ? null : () => _autoDetectSpots(bright: false),
+              icon: const Icon(Icons.lightbulb),
+              label: const Text('Detect dark')),
           FilledButton.icon(
               onPressed: _model.nodeCount == 0 ? null : _autoWire,
               icon: const Icon(Icons.timeline),
@@ -564,6 +751,10 @@ class _HomePageState extends State<HomePage> {
               value: _InteractMode.lasso, child: Text('Lasso select')),
           DropdownMenuItem(
               value: _InteractMode.measure, child: Text('Measure')),
+          DropdownMenuItem(
+              value: _InteractMode.addNode, child: Text('Add node')),
+          DropdownMenuItem(
+              value: _InteractMode.lassoErase, child: Text('Lasso erase')),
         ],
         onChanged: (v) => setState(() {
           _mode = v ?? _mode;
@@ -574,9 +765,15 @@ class _HomePageState extends State<HomePage> {
           _measureA = -1;
           _measureB = -1;
           if (!_isSelectMode) _selection.clear();
-          _status = _mode == _InteractMode.measure
-              ? 'Measure: click a node, then a second to read the distance.'
-              : '${_modeName(_mode)} mode.';
+          _status = switch (_mode) {
+            _InteractMode.measure =>
+              'Measure: click a node, then a second to read the distance.',
+            _InteractMode.addNode =>
+              'Add node: click to place, click a node to remove it.',
+            _InteractMode.lassoErase =>
+              'Lasso erase: draw a loop around nodes to delete them.',
+            _ => '${_modeName(_mode)} mode.',
+          };
         }),
       ),
     );
@@ -653,34 +850,45 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  // Fit-to-window transform (screen = scene * scale + offset) for the current model.
+  // Fit-to-window transform (screen = scene * scale + offset) for the current
+  // model and/or backdrop image.
   ({double scale, Offset offset}) _computeFit(Size size) {
-    if (_model.nodeCount == 0) return (scale: 1, offset: Offset.zero);
-    var minx = _model.nodes.first.x, maxx = minx;
-    var miny = -_model.nodes.first.y, maxy = miny;
+    if (_model.nodeCount == 0 && _bgImage == null) {
+      return (scale: 1, offset: Offset.zero);
+    }
+    double? minx, maxx, miny, maxy;
+    void include(double x, double sy) {
+      minx = minx == null ? x : math.min(minx!, x);
+      maxx = maxx == null ? x : math.max(maxx!, x);
+      miny = miny == null ? sy : math.min(miny!, sy);
+      maxy = maxy == null ? sy : math.max(maxy!, sy);
+    }
+
     for (final n in _model.nodes) {
-      minx = math.min(minx, n.x);
-      maxx = math.max(maxx, n.x);
-      final sy = -n.y;
-      miny = math.min(miny, sy);
-      maxy = math.max(maxy, sy);
+      include(n.x, -n.y);
+    }
+    // The image is drawn in scene rect (0,0)-(width,height); include its corners.
+    if (_bgImage != null) {
+      include(0, 0);
+      include(_bgImage!.width.toDouble(), _bgImage!.height.toDouble());
     }
     const pad = 24.0;
-    final spanX = (maxx - minx).abs() < 1e-6 ? 1.0 : maxx - minx;
-    final spanY = (maxy - miny).abs() < 1e-6 ? 1.0 : maxy - miny;
+    final spanX = (maxx! - minx!).abs() < 1e-6 ? 1.0 : maxx! - minx!;
+    final spanY = (maxy! - miny!).abs() < 1e-6 ? 1.0 : maxy! - miny!;
     final sx = (size.width - pad * 2) / spanX;
     final sy = (size.height - pad * 2) / spanY;
     final s = sx < sy ? sx : sy;
-    return (scale: s, offset: Offset(pad - minx * s, pad - miny * s));
+    return (scale: s, offset: Offset(pad - minx! * s, pad - miny! * s));
   }
 
   Widget _canvas() {
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = constraints.biggest;
-        // Fit the model to the view once after it loads; the wheel then zooms.
+        // Fit the model (or backdrop image) to the view once after it loads; the
+        // wheel then zooms.
         if (_needFit &&
-            _model.nodeCount > 0 &&
+            (_model.nodeCount > 0 || _bgImage != null) &&
             size.width > 0 &&
             size.height > 0) {
           final fit = _computeFit(size);
@@ -702,11 +910,21 @@ class _HomePageState extends State<HomePage> {
           _showWires,
           _viewScale,
           _viewOffset,
+          _bgImage,
+          _mode == _InteractMode.lassoErase,
         );
 
         void onTap(Offset local) {
           final scene = painter.toScene(local);
           if (scene == null) return;
+          if (_unwireModifier) {
+            _unwireSceneHit(scene); // Ctrl-click unwires, whatever the mode
+            return;
+          }
+          if (_mode == _InteractMode.addNode) {
+            _addOrRemoveNodeAt(scene);
+            return;
+          }
           final idx = _nearestIndex(scene);
           if (idx < 0) return;
           switch (_mode) {
@@ -721,10 +939,26 @@ class _HomePageState extends State<HomePage> {
                   : _selection.add(idx));
             case _InteractMode.measure:
               _measurePick(idx);
+            case _InteractMode.addNode:
+              break; // handled above
+            case _InteractMode.lassoErase:
+              break; // erasing happens on the drag, not a tap
           }
         }
 
-        return Listener(
+        return Focus(
+          autofocus: true,
+          // Delete / Backspace: remove the wiring of the node under the cursor.
+          onKeyEvent: (_, e) {
+            if (e is KeyDownEvent &&
+                (e.logicalKey == LogicalKeyboardKey.delete ||
+                    e.logicalKey == LogicalKeyboardKey.backspace)) {
+              _removeWireAt(_hoverLocal, painter);
+              return KeyEventResult.handled;
+            }
+            return KeyEventResult.ignored;
+          },
+          child: Listener(
           // Mouse wheel: zoom in/out toward the cursor.
           onPointerSignal: (e) {
             if (e is PointerScrollEvent && _viewScale > 0) {
@@ -744,8 +978,11 @@ class _HomePageState extends State<HomePage> {
             if ((e.buttons & kMiddleMouseButton) != 0) _middlePanning = true;
           },
           onPointerMove: (e) {
+            _hoverLocal = e.localPosition;
             if (_middlePanning) setState(() => _viewOffset += e.delta);
           },
+          // Track the cursor so keyboard actions know which node it's over.
+          onPointerHover: (e) => _hoverLocal = e.localPosition,
           onPointerUp: (_) => _middlePanning = false,
           onPointerCancel: (_) => _middlePanning = false,
           child: GestureDetector(
@@ -754,14 +991,19 @@ class _HomePageState extends State<HomePage> {
             if (_mode == _InteractMode.manual) _undoLast();
           },
           onPanStart: (d) {
-            if (_panModifier) {
+            if (_unwireModifier) {
+              _unwiring = true; // Ctrl-drag: unwire nodes along the path
+              final scene = painter.toScene(d.localPosition);
+              if (scene != null) _unwireSceneHit(scene);
+            } else if (_panModifier) {
               _panning = true; // Shift-drag: pan the view
             } else if (_mode == _InteractMode.section) {
               setState(() {
                 _dragStart = d.localPosition;
                 _dragCurrent = d.localPosition;
               });
-            } else if (_mode == _InteractMode.lasso) {
+            } else if (_mode == _InteractMode.lasso ||
+                _mode == _InteractMode.lassoErase) {
               setState(() {
                 _lassoPoints
                   ..clear()
@@ -774,11 +1016,15 @@ class _HomePageState extends State<HomePage> {
             }
           },
           onPanUpdate: (d) {
-            if (_panning) {
+            if (_unwiring) {
+              final scene = painter.toScene(d.localPosition);
+              if (scene != null) _unwireSceneHit(scene);
+            } else if (_panning) {
               setState(() => _viewOffset += d.delta); // pan with the drag
             } else if (_mode == _InteractMode.section) {
               setState(() => _dragCurrent = d.localPosition);
-            } else if (_mode == _InteractMode.lasso) {
+            } else if (_mode == _InteractMode.lasso ||
+                _mode == _InteractMode.lassoErase) {
               setState(() => _lassoPoints.add(d.localPosition));
             } else if (_mode == _InteractMode.manual) {
               final scene = painter.toScene(d.localPosition);
@@ -789,7 +1035,9 @@ class _HomePageState extends State<HomePage> {
             }
           },
           onPanEnd: (_) {
-            if (_panning) {
+            if (_unwiring) {
+              _unwiring = false;
+            } else if (_panning) {
               _panning = false;
             } else if (_mode == _InteractMode.section &&
                 _dragStart != null &&
@@ -827,11 +1075,43 @@ class _HomePageState extends State<HomePage> {
                 }
                 _lassoPoints.clear();
               });
+            } else if (_mode == _InteractMode.lassoErase &&
+                _lassoPoints.length >= 3) {
+              // Convert the freeform path to scene coords and delete the nodes it
+              // encloses (their wiring closes up as each is removed).
+              final poly = <Offset>[];
+              for (final p in _lassoPoints) {
+                final s = painter.toScene(p);
+                if (s != null) poly.add(s);
+              }
+              setState(() {
+                var removed = 0;
+                if (poly.length >= 3) {
+                  // Delete from the end so earlier indices stay valid.
+                  for (var i = _model.nodeCount - 1; i >= 0; i--) {
+                    final n = _model.nodes[i];
+                    if (_pointInPolygon(Offset(n.x, -n.y), poly)) {
+                      _model.removeNode(i);
+                      removed++;
+                    }
+                  }
+                }
+                if (removed > 0) {
+                  // Indices shifted, so any cached references are now stale.
+                  _startIndex = -1;
+                  _selection.clear();
+                  _measureA = -1;
+                  _measureB = -1;
+                }
+                _status = 'Erased $removed node(s).';
+                _lassoPoints.clear();
+              });
             } else {
               setState(() => _lassoPoints.clear());
             }
           },
           child: CustomPaint(size: size, painter: painter),
+          ),
           ),
         );
       },
@@ -843,7 +1123,7 @@ class _NodePainter extends CustomPainter {
   _NodePainter(
       this.model, this.startIndex, this.selection, this.dragStart, this.dragCurrent,
       this.lassoPoints, this.measureA, this.measureB, this.wireGapMm,
-      this.showWires, this.scale, this.offset);
+      this.showWires, this.scale, this.offset, this.image, this.eraseLasso);
   final Model model;
   final int startIndex;
   final Set<int> selection;
@@ -856,6 +1136,8 @@ class _NodePainter extends CustomPainter {
   final bool showWires; // whether to draw the wire run between numbered nodes
   final double scale; // screen = scene * scale + offset
   final Offset offset;
+  final ui.Image? image; // backdrop drawn in scene rect (0,0)-(width,height)
+  final bool eraseLasso; // draw the freeform lasso in red (delete) vs orange
 
   // Screen position of a node's marker centre.
   Offset _screen(int i) {
@@ -864,13 +1146,24 @@ class _NodePainter extends CustomPainter {
   }
 
   Offset? toScene(Offset local) {
-    if (model.nodeCount == 0 || scale == 0) return null;
+    if (scale == 0) return null;
     return Offset((local.dx - offset.dx) / scale, (local.dy - offset.dy) / scale);
   }
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (model.nodeCount == 0 || scale == 0) return;
+    if (scale == 0) return;
+
+    // Backdrop image, drawn in scene rect (0,0)-(width,height).
+    if (image != null) {
+      final src = Rect.fromLTWH(
+          0, 0, image!.width.toDouble(), image!.height.toDouble());
+      final dst = Rect.fromLTWH(
+          offset.dx, offset.dy, image!.width * scale, image!.height * scale);
+      canvas.drawImageRect(image!, src, dst, Paint());
+    }
+
+    if (model.nodeCount == 0) return;
 
     // Wire run: connect consecutively numbered nodes. A segment longer than the
     // wire gap is drawn red so over-length hops stand out; others are blue.
@@ -972,16 +1265,19 @@ class _NodePainter extends CustomPainter {
             ..color = const Color(0xFFFF9628));
     }
 
-    // Live freeform lasso path (drawn directly in widget coords).
+    // Live freeform lasso path (drawn directly in widget coords). Red while
+    // erasing nodes, orange while selecting.
     if (lassoPoints.length >= 2) {
+      final fillCol = eraseLasso ? const Color(0x28EF3030) : const Color(0x28FF9628);
+      final lineCol = eraseLasso ? const Color(0xFFEF3030) : const Color(0xFFFF9628);
       final path = Path()..addPolygon(lassoPoints, true);
-      canvas.drawPath(path, Paint()..color = const Color(0x28FF9628));
+      canvas.drawPath(path, Paint()..color = fillCol);
       canvas.drawPath(
           path,
           Paint()
             ..style = PaintingStyle.stroke
             ..strokeWidth = 1.5
-            ..color = const Color(0xFFFF9628));
+            ..color = lineCol);
     }
   }
 

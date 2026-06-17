@@ -53,6 +53,28 @@ class Model {
     if (index >= 0 && index < _nodes.length) _nodes[index].nodeNumber = number;
   }
 
+  /// Removes a single node from the wire run and closes the gap so the run stays
+  /// continuous: every node numbered above the removed one shifts down by one.
+  /// Returns true if the node was wired (and so something changed).
+  bool removeFromWiring(int index) {
+    if (index < 0 || index >= _nodes.length) return false;
+    final removed = _nodes[index].nodeNumber;
+    if (removed == 0) return false;
+    _nodes[index].nodeNumber = 0;
+    for (final n in _nodes) {
+      if (n.nodeNumber > removed) n.nodeNumber--;
+    }
+    return true;
+  }
+
+  /// Deletes a node entirely (e.g. a manually-placed one), first closing any
+  /// wiring gap it leaves so the remaining run stays continuous.
+  void removeNode(int index) {
+    if (index < 0 || index >= _nodes.length) return;
+    removeFromWiring(index);
+    _nodes.removeAt(index);
+  }
+
   /// Builds an xLights custom model (.xmodel) XML string from the wired nodes.
   String toXModel() {
     if (_nodes.isEmpty) return '';
